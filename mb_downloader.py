@@ -10,7 +10,7 @@ from datetime import datetime
 class MalwareDownloader:
     """Main class managing malware download operations via MalwareBazaar API."""
     
-    def __init__(self, api_key, output_dir, limit=50, days=None, exact_date=None, no_dupes=False):
+    def __init__(self, api_key, output_dir, limit=50, days=None, exact_date=None, date_range=None, no_dupes=False):
         # Base Configurations
         self.api_url = "https://mb-api.abuse.ch/api/v1/"
         self.zip_password = b"infected"
@@ -21,8 +21,18 @@ class MalwareDownloader:
         self.limit = limit
         self.days = days
         self.exact_date = exact_date
+        self.date_range = date_range
         self.no_dupes = no_dupes
         
+        # Parse Date Range if provided
+        self.start_dt = None
+        self.end_dt = None
+        if self.date_range:
+            start_str, end_str = self.date_range.split(":")
+            self.start_dt = datetime.strptime(start_str.strip(), "%Y-%m-%d")
+            # Set end date to the very last second of that day to include all samples
+            self.end_dt = datetime.strptime(end_str.strip(), "%Y-%m-%d").replace(hour=23, minute=59, second=59)
+            
         # Directory and File Paths
         self.today_str = datetime.now().strftime("%Y-%m-%d")
         self._setup_directories()
@@ -100,6 +110,11 @@ class MalwareDownloader:
                             if self.exact_date is not None:
                                 sample_date_only = first_seen_date.strftime("%Y-%m-%d")
                                 if sample_date_only != self.exact_date:
+                                    continue
+
+                            # Filter 3: Date Range (--date-range)
+                            if self.date_range is not None:
+                                if not (self.start_dt <= first_seen_date <= self.end_dt):
                                     continue
                                     
                         except ValueError:
@@ -257,10 +272,11 @@ def main():
     parser.add_argument("-k", "--api-key", type=str, help="MalwareBazaar API Key (Optional if mb_config.conf is used)")
     parser.add_argument("-l", "--limit", type=int, default=50, help="Maximum number of samples to fetch from API (Default: 50)")
     
-    # Date Filter Group (Must choose zero or one, cannot choose both)
+    # Date Filter Group (Must choose zero or one, cannot choose multiple)
     date_group = parser.add_mutually_exclusive_group()
     date_group.add_argument("-d", "--days", type=int, help="Only download samples from the last X days")
     date_group.add_argument("--date", type=str, help="Download samples from an exact date (Format: YYYY-MM-DD)")
+    date_group.add_argument("--date-range", type=str, help="Download samples from a date range (Format: YYYY-MM-DD:YYYY-MM-DD)")
     
     parser.add_argument("--no-dupes", action="store_true", help="Skip previously downloaded files (Prevent Duplicate)")
 
@@ -272,6 +288,20 @@ def main():
             datetime.strptime(args.date, "%Y-%m-%d")
         except ValueError:
             print("[-] ERROR: Incorrect date format. Please use YYYY-MM-DD (e.g., 2026-03-15).")
+            sys.exit(1)
+            
+    # Validate date range format if provided
+    if args.date_range:
+        try:
+            start_str, end_str = args.date_range.split(":")
+            start_dt = datetime.strptime(start_str.strip(), "%Y-%m-%d")
+            end_dt = datetime.strptime(end_str.strip(), "%Y-%m-%d")
+            
+            if start_dt > end_dt:
+                print("[-] ERROR: Start date cannot be after end date.")
+                sys.exit(1)
+        except ValueError:
+            print("[-] ERROR: Incorrect date range format. Please use YYYY-MM-DD:YYYY-MM-DD (e.g., 2026-03-10:2026-03-15).")
             sys.exit(1)
 
     api_key = get_api_key(args.api_key)
@@ -293,6 +323,7 @@ def main():
         limit=args.limit,
         days=args.days,
         exact_date=args.date,
+        date_range=args.date_range,
         no_dupes=args.no_dupes
     )
     
