@@ -60,7 +60,8 @@ class MalwareDownloader:
     def _setup_directories(self):
         if not os.path.exists(self.output_dir): 
             os.makedirs(self.output_dir)
-        self.day_folder = os.path.join(self.output_dir, self.today_str)
+        # --- KLASÖR DÜZENİ: İndirme Tarihi ---
+        self.day_folder = os.path.join(self.output_dir, f"download_date_{self.today_str}")
         if not os.path.exists(self.day_folder): 
             os.makedirs(self.day_folder)
 
@@ -83,10 +84,6 @@ class MalwareDownloader:
 
     def run_legacy(self, search_type, search_values, search_name):
         for val in search_values:
-            target_dir = os.path.join(self.day_folder, val)
-            if not os.path.exists(target_dir): 
-                os.makedirs(target_dir)
-            
             data = {'query': search_type, 'limit': self.limit}
             if search_type == 'get_taginfo': 
                 data['tag'] = val
@@ -101,6 +98,15 @@ class MalwareDownloader:
                     h = entry['sha256_hash']
                     sig = entry.get('signature', 'Unknown')
                     f_type = entry.get('file_type', 'Unknown').lower()
+                    
+                    # --- KLASÖR DÜZENİ: Zararlı Tarihi (Legacy) ---
+                    first_seen = entry.get('first_seen', '')
+                    malware_date = first_seen.split(' ')[0] if first_seen else 'Unknown_Date'
+                    folder_prefix = f"malware_date_{malware_date}" if malware_date != 'Unknown_Date' else 'Unknown_Date'
+                    
+                    target_dir = os.path.join(self.day_folder, folder_prefix, val)
+                    if not os.path.exists(target_dir): 
+                        os.makedirs(target_dir)
                     
                     if self.allowed_extensions and f_type not in self.allowed_extensions:
                         continue
@@ -127,11 +133,17 @@ class MalwareDownloader:
         current_date = self.start_dt
         while current_date <= self.end_dt:
             date_str = current_date.strftime("%Y-%m-%d")
+            
+            # --- KLASÖR DÜZENİ: Zararlı Tarihi (Advanced) ---
+            malware_date_folder = os.path.join(self.day_folder, f"malware_date_{date_str}")
+            if not os.path.exists(malware_date_folder):
+                os.makedirs(malware_date_folder)
+                
             print(f"\n[*] Processing Daily Batch: {date_str}")
             
-            # --- SENİN VERDİĞİN LİNK BURADA ---
-            batch_url = f"https://datalake.abuse.ch/malware-bazaar/daily/{date_str}.zip"
-            batch_zip_path = os.path.join(self.day_folder, f"batch_{date_str}.zip")
+            # DOĞRU URL
+            batch_url = f"https://mb-api.abuse.ch/downloads/{date_str}.zip"
+            batch_zip_path = os.path.join(malware_date_folder, f"batch_{date_str}.zip")
             
             print(f"[*] Downloading massive payload batch from {batch_url} ...")
             try:
@@ -143,7 +155,7 @@ class MalwareDownloader:
                         current_date += timedelta(days=1)
                         continue
                         
-                    # İndirme boyutunu doğrulamak için total size'ı çekiyoruz (Traceback'i engellemek için)
+                    # ÇÖKME KORUMASI: İndirme boyutunu doğrulama
                     total_size_in_bytes = int(r.headers.get('content-length', 0))
                     downloaded_size = 0
                         
@@ -153,7 +165,6 @@ class MalwareDownloader:
                                 f.write(chunk)
                                 downloaded_size += len(chunk)
                                 
-                    # İndirme boyutu eksikse arşivi açmaya çalışmadan direkt silip atla
                     if total_size_in_bytes != 0 and downloaded_size < total_size_in_bytes:
                         print(f"[-] ERROR: Download incomplete. Expected {total_size_in_bytes} bytes, got {downloaded_size} bytes.")
                         os.remove(batch_zip_path)
@@ -206,7 +217,7 @@ class MalwareDownloader:
                                     if not is_pe:
                                         continue
                                         
-                            target_dir = os.path.join(self.day_folder, search_values[0])
+                            target_dir = os.path.join(malware_date_folder, search_values[0])
                             if not os.path.exists(target_dir): 
                                 os.makedirs(target_dir)
                             
