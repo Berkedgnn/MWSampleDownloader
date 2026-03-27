@@ -21,7 +21,13 @@ class MalwareDownloader:
         self.exact_date = exact_date
         self.date_range = date_range
         self.no_dupes = no_dupes
-        self.allowed_extensions = [ext.strip().lower() for ext in extensions.split(",")] if extensions else None
+        
+        if extensions:
+            self.allowed_extensions = [ext.strip().lower() for ext in extensions.split(",")]
+            if "imphash" in self.allowed_extensions or "pe" in self.allowed_extensions:
+                self.allowed_extensions.extend(["exe", "dll", "sys", "ocx"])
+        else:
+            self.allowed_extensions = None
         
         self.start_dt = None
         self.end_dt = None
@@ -53,7 +59,7 @@ class MalwareDownloader:
     def _setup_directories(self):
         if not os.path.exists(self.output_dir): 
             os.makedirs(self.output_dir)
-        self.day_folder = os.path.join(self.output_dir, self.today_str)
+        self.day_folder = os.path.join(self.output_dir, f"download_date_{self.today_str}")
         if not os.path.exists(self.day_folder): 
             os.makedirs(self.day_folder)
 
@@ -76,10 +82,6 @@ class MalwareDownloader:
 
     def run_legacy(self, search_type, search_values, search_name):
         for val in search_values:
-            target_dir = os.path.join(self.day_folder, val)
-            if not os.path.exists(target_dir): 
-                os.makedirs(target_dir)
-            
             data = {'query': search_type, 'limit': self.limit}
             if search_type == 'get_taginfo': 
                 data['tag'] = val
@@ -94,6 +96,14 @@ class MalwareDownloader:
                     h = entry['sha256_hash']
                     sig = entry.get('signature', 'Unknown')
                     f_type = entry.get('file_type', 'Unknown').lower()
+                    
+                    first_seen = entry.get('first_seen', '')
+                    malware_date = first_seen.split(' ')[0] if first_seen else 'Unknown_Date'
+                    folder_prefix = f"malware_date_{malware_date}" if malware_date != 'Unknown_Date' else 'Unknown_Date'
+                    
+                    target_dir = os.path.join(self.day_folder, folder_prefix, val)
+                    if not os.path.exists(target_dir): 
+                        os.makedirs(target_dir)
                     
                     if self.allowed_extensions and f_type not in self.allowed_extensions:
                         continue
@@ -120,10 +130,15 @@ class MalwareDownloader:
         current_date = self.start_dt
         while current_date <= self.end_dt:
             date_str = current_date.strftime("%Y-%m-%d")
+            
+            malware_date_folder = os.path.join(self.day_folder, f"malware_date_{date_str}")
+            if not os.path.exists(malware_date_folder):
+                os.makedirs(malware_date_folder)
+                
             print(f"\n[*] Processing Daily Batch: {date_str}")
             
             batch_url = f"https://datalake.abuse.ch/malware-bazaar/daily/{date_str}.zip"
-            batch_zip_path = os.path.join(self.day_folder, f"batch_{date_str}.zip")
+            batch_zip_path = os.path.join(malware_date_folder, f"batch_{date_str}.zip")
             
             print(f"[*] Downloading massive payload batch from {batch_url} ...")
             try:
@@ -155,14 +170,12 @@ class MalwareDownloader:
                         total_files = len(file_list)
                         
                         for i, filename in enumerate(file_list):
-                            # --- YESIL PROGRESS BAR ---
                             percent = (i + 1) / total_files
                             bar_length = 40
                             filled_length = int(bar_length * percent)
                             bar = '█' * filled_length + '-' * (bar_length - filled_length)
                             sys.stdout.write(f'\r\033[92m[*] Analyzing Magic Bytes: |{bar}| {percent:.1%} ({i+1}/{total_files})\033[0m')
                             sys.stdout.flush()
-                            # --------------------------
 
                             sha256_hash = filename.split('.')[0]
                             
@@ -178,11 +191,13 @@ class MalwareDownloader:
                             except Exception:
                                 pass
                                 
-                            if self.allowed_extensions and ("exe" in self.allowed_extensions or "dll" in self.allowed_extensions):
-                                if not is_pe:
-                                    continue
-                                    
-                            target_dir = os.path.join(self.day_folder, search_values[0])
+                            if self.allowed_extensions:
+                                pe_targets = ['exe', 'dll', 'sys', 'ocx', 'imphash', 'pe']
+                                if any(ext in self.allowed_extensions for ext in pe_targets):
+                                    if not is_pe:
+                                        continue
+                                        
+                            target_dir = os.path.join(malware_date_folder, search_values[0])
                             if not os.path.exists(target_dir): 
                                 os.makedirs(target_dir)
                             
@@ -201,7 +216,7 @@ class MalwareDownloader:
                             except Exception:
                                 pass
                         
-                        print() # Progress bar bittikten sonra alt satira in
+                        print() 
                                 
                 except zipfile.BadZipFile:
                      print("\n[-] ERROR: Downloaded massive batch is corrupted.")
@@ -272,7 +287,7 @@ def main():
     parser.add_argument("-m", "--mode", choices=['legacy', 'advanced'], default='legacy')
     parser.add_argument("-k", "--api-key", type=str)
     parser.add_argument("-l", "--limit", type=int, default=100)
-    parser.add_argument("-e", "--ext", type=str)
+    parser.add_argument("-e", "--ext", type=str, help="e.g. 'exe,dll' or 'imphash' to grab all PE files")
     
     date_group = parser.add_mutually_exclusive_group()
     date_group.add_argument("-d", "--days", type=int)
