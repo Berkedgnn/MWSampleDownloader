@@ -6,7 +6,6 @@ import csv
 import sys
 import configparser
 import zipfile
-import io
 from datetime import datetime, timedelta
 
 class MalwareDownloader:
@@ -121,85 +120,83 @@ class MalwareDownloader:
         current_date = self.start_dt
         while current_date <= self.end_dt:
             date_str = current_date.strftime("%Y-%m-%d")
-            print(f"[*] Processing: {date_str}")
+            print(f"\n[*] Processing Daily Batch: {date_str}")
             
-            csv_url = f"https://bazaar.abuse.ch/export/csv/daily/{date_str}.zip"
-            res_csv = requests.get(csv_url)
-            
-            if res_csv.status_code != 200:
-                current_date += timedelta(days=1)
-                continue
-                
-            matching_hashes = {}
-            with zipfile.ZipFile(io.BytesIO(res_csv.content)) as z:
-                csv_filename = z.namelist()[0]
-                with z.open(csv_filename) as f:
-                    content = f.read().decode('utf-8').splitlines()
-                    reader = csv.reader(content)
-                    for row in reader:
-                        if not row or row[0].startswith('#'): continue
-                        if len(row) < 11: continue
-                        
-                        row_hash = row[1].strip()
-                        row_sig = row[9].strip().lower()
-                        row_tags = row[10].strip().lower()
-                        row_type = row[7].strip().lower()
-                        
-                        if self.allowed_extensions and row_type not in self.allowed_extensions:
-                            continue
-                        
-                        for val in search_values:
-                            val_lower = val.lower()
-                            if search_name == "ALL" or val_lower == "all":
-                                matching_hashes[row_hash] = ("All_Samples", row_sig, row_type)
-                                break
-                            elif search_name == "SIGNATURE" and val_lower in row_sig:
-                                matching_hashes[row_hash] = (val, row_sig, row_type)
-                            elif search_name == "TAG" and val_lower in row_tags:
-                                matching_hashes[row_hash] = (val, row_sig, row_type)
-
-            if self.no_dupes:
-                matching_hashes = {k: v for k, v in matching_hashes.items() if k not in self.downloaded_history}
-                
-            if not matching_hashes:
-                current_date += timedelta(days=1)
-                continue
-
             batch_url = f"https://mb-api.abuse.ch/downloads/{date_str}.zip"
-            batch_zip_path = os.path.join(self.day_folder, f"temp_batch_{date_str}.zip")
+            batch_zip_path = os.path.join(self.day_folder, f"batch_{date_str}.zip")
             
-            with requests.get(batch_url, stream=True) as r:
-                if r.status_code == 200:
+            print(f"[*] Downloading massive payload batch from {batch_url} ...")
+            try:
+                with requests.get(batch_url, stream=True) as r:
+                    if r.status_code != 200:
+                        print(f"[-] No batch found for {date_str}. It might be too old or not generated yet.")
+                        current_date += timedelta(days=1)
+                        continue
+                        
                     with open(batch_zip_path, 'wb') as f:
                         for chunk in r.iter_content(chunk_size=8192): 
-                            f.write(chunk)
+                            if chunk:
+                                f.write(chunk)
+            except Exception as e:
+                print(f"[-] Download failed: {e}")
+                current_date += timedelta(days=1)
+                continue
+            
+            print(f"[*] Analyzing binary headers (Magic Bytes) inside the archive...")
+            extracted_count = 0
             
             if os.path.exists(batch_zip_path):
                 try:
                     with pyzipper.AESZipFile(batch_zip_path, 'r', encryption=pyzipper.WZ_AES) as z:
                         z.pwd = self.zip_password
-                        for h_key, meta in matching_hashes.items():
-                            expected_filename = f"{h_key}.{meta[2]}"
-                            fallback_filename = f"{h_key}.exe"
+                        
+                        for filename in z.namelist():
+                            sha256_hash = filename.split('.')[0]
                             
-                            target_dir = os.path.join(self.day_folder, meta[0])
+                            if self.no_dupes and sha256_hash in self.downloaded_history:
+                                continue
+                                
+                            is_pe = False
+                            try:
+                                with z.open(filename) as f:
+                                    header = f.read(2)
+                                    if header == b'MZ':
+                                        is_pe = True
+                            except Exception:
+                                pass
+                                
+                            if self.allowed_extensions and ("exe" in self.allowed_extensions or "dll" in self.allowed_extensions):
+                                if not is_pe:
+                                    continue
+                                    
+                            target_dir = os.path.join(self.day_folder, search_values[0])
                             if not os.path.exists(target_dir): 
                                 os.makedirs(target_dir)
                             
+                            save_name = f"{sha256_hash}.exe" if is_pe else filename
+                            
                             try:
-                                z.extract(expected_filename, path=target_dir)
-                                self._log_advanced(h_key, target_dir, expected_filename, meta)
-                            except KeyError:
-                                try:
-                                    z.extract(fallback_filename, path=target_dir)
-                                    self._log_advanced(h_key, target_dir, fallback_filename, meta)
-                                except Exception:
-                                    pass
+                                z.extract(filename, path=target_dir)
+                                old_path = os.path.join(target_dir, filename)
+                                new_path = os.path.join(target_dir, save_name)
+                                
+                                if old_path != new_path and os.path.exists(old_path):
+                                    os.rename(old_path, new_path)
+                                    
+                                self._log_advanced(sha256_hash, target_dir, save_name, [search_values[0], "Unknown", "PE_File" if is_pe else "Unknown"])
+                                extracted_count += 1
+                            except Exception:
+                                pass
+                                
                 except zipfile.BadZipFile:
-                    pass
+                     print("[-] ERROR: Downloaded massive batch is corrupted.")
                      
-                os.remove(batch_zip_path)
-            
+                try:
+                    os.remove(batch_zip_path)
+                except Exception:
+                    pass
+                    
+            print(f"[+] Advanced extraction complete. Acquired {extracted_count} samples for {date_str}.")
             current_date += timedelta(days=1)
 
     def _extract_and_log(self, zip_path, target_dir, sha256_hash, search_val, signature, f_type, yara_str):
@@ -274,10 +271,13 @@ def main():
         if args.mode == 'legacy':
             print("[-] ERROR: Legacy mode requires a -t (tag) or -s (sig) parameter.")
             sys.exit(1)
-        stype, svals, sname = ('all', ['all'], 'ALL')
+        stype, svals, sname = ('all', ['All_Samples'], 'ALL')
     else:
-        stype, svals, sname = ('get_siginfo', [v.strip() for v in args.sig.split(",")], "SIGNATURE") if args.sig else ('get_taginfo', [v.strip() for v in args.tag.split(",")], "TAG")
-    
+        if args.sig:
+            stype, svals, sname = 'get_siginfo', [v.strip() for v in args.sig.split(",")], "SIGNATURE"
+        else:
+            stype, svals, sname = 'get_taginfo', [v.strip() for v in args.tag.split(",")], "TAG"
+            
     api_key = get_api_key(args.api_key)
     
     downloader = MalwareDownloader(
