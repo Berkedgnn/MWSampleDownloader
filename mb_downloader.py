@@ -122,14 +122,18 @@ class MalwareDownloader:
             date_str = current_date.strftime("%Y-%m-%d")
             print(f"\n[*] Processing Daily Batch: {date_str}")
             
-            batch_url = f"https://mb-api.abuse.ch/downloads/{date_str}.zip"
+            # DOĞRU VERİ GÖLÜ (DATALAKE) LİNKİ
+            batch_url = f"https://datalake.abuse.ch/malware-bazaar/daily/{date_str}.zip"
             batch_zip_path = os.path.join(self.day_folder, f"batch_{date_str}.zip")
             
             print(f"[*] Downloading massive payload batch from {batch_url} ...")
             try:
                 with requests.get(batch_url, stream=True) as r:
-                    if r.status_code != 200:
-                        print(f"[-] No batch found for {date_str}. It might be too old or not generated yet.")
+                    content_type = r.headers.get('Content-Type', '')
+                    
+                    # GÜVENLİK KALKANI: Gelen dosya gerçekten ZIP değilse (Soft 404 HTML ise) atla!
+                    if r.status_code != 200 or 'zip' not in content_type.lower():
+                        print(f"[-] No valid zip batch found for {date_str}. Server returned a non-zip response.")
                         current_date += timedelta(days=1)
                         continue
                         
