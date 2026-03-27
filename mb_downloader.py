@@ -122,7 +122,6 @@ class MalwareDownloader:
             date_str = current_date.strftime("%Y-%m-%d")
             print(f"\n[*] Processing Daily Batch: {date_str}")
             
-            # DOĞRU VERİ GÖLÜ (DATALAKE) LİNKİ
             batch_url = f"https://datalake.abuse.ch/malware-bazaar/daily/{date_str}.zip"
             batch_zip_path = os.path.join(self.day_folder, f"batch_{date_str}.zip")
             
@@ -131,7 +130,6 @@ class MalwareDownloader:
                 with requests.get(batch_url, stream=True) as r:
                     content_type = r.headers.get('Content-Type', '')
                     
-                    # GÜVENLİK KALKANI: Gelen dosya gerçekten ZIP değilse (Soft 404 HTML ise) atla!
                     if r.status_code != 200 or 'zip' not in content_type.lower():
                         print(f"[-] No valid zip batch found for {date_str}. Server returned a non-zip response.")
                         current_date += timedelta(days=1)
@@ -146,7 +144,6 @@ class MalwareDownloader:
                 current_date += timedelta(days=1)
                 continue
             
-            print(f"[*] Analyzing binary headers (Magic Bytes) inside the archive...")
             extracted_count = 0
             
             if os.path.exists(batch_zip_path):
@@ -154,7 +151,19 @@ class MalwareDownloader:
                     with pyzipper.AESZipFile(batch_zip_path, 'r', encryption=pyzipper.WZ_AES) as z:
                         z.pwd = self.zip_password
                         
-                        for filename in z.namelist():
+                        file_list = z.namelist()
+                        total_files = len(file_list)
+                        
+                        for i, filename in enumerate(file_list):
+                            # --- YESIL PROGRESS BAR ---
+                            percent = (i + 1) / total_files
+                            bar_length = 40
+                            filled_length = int(bar_length * percent)
+                            bar = '█' * filled_length + '-' * (bar_length - filled_length)
+                            sys.stdout.write(f'\r\033[92m[*] Analyzing Magic Bytes: |{bar}| {percent:.1%} ({i+1}/{total_files})\033[0m')
+                            sys.stdout.flush()
+                            # --------------------------
+
                             sha256_hash = filename.split('.')[0]
                             
                             if self.no_dupes and sha256_hash in self.downloaded_history:
@@ -191,9 +200,11 @@ class MalwareDownloader:
                                 extracted_count += 1
                             except Exception:
                                 pass
+                        
+                        print() # Progress bar bittikten sonra alt satira in
                                 
                 except zipfile.BadZipFile:
-                     print("[-] ERROR: Downloaded massive batch is corrupted.")
+                     print("\n[-] ERROR: Downloaded massive batch is corrupted.")
                      
                 try:
                     os.remove(batch_zip_path)
