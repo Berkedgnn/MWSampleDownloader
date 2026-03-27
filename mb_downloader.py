@@ -150,7 +150,10 @@ class MalwareDownloader:
                         
                         for val in search_values:
                             val_lower = val.lower()
-                            if search_name == "SIGNATURE" and val_lower in row_sig:
+                            if search_name == "ALL" or val_lower == "all":
+                                matching_hashes[row_hash] = ("All_Samples", row_sig, row_type)
+                                break
+                            elif search_name == "SIGNATURE" and val_lower in row_sig:
                                 matching_hashes[row_hash] = (val, row_sig, row_type)
                             elif search_name == "TAG" and val_lower in row_tags:
                                 matching_hashes[row_hash] = (val, row_sig, row_type)
@@ -249,7 +252,7 @@ def get_api_key(args_api_key):
 def main():
     parser = argparse.ArgumentParser(description="MalwareBazaar Downloader")
     
-    group = parser.add_mutually_exclusive_group(required=True)
+    group = parser.add_mutually_exclusive_group(required=False)
     group.add_argument("-t", "--tag", type=str)
     group.add_argument("-s", "--sig", type=str)
     
@@ -267,9 +270,15 @@ def main():
     parser.add_argument("--no-dupes", action="store_true")
     args = parser.parse_args()
     
-    api_key = get_api_key(args.api_key)
+    if not args.tag and not args.sig:
+        if args.mode == 'legacy':
+            print("[-] ERROR: Legacy mode requires a -t (tag) or -s (sig) parameter.")
+            sys.exit(1)
+        stype, svals, sname = ('all', ['all'], 'ALL')
+    else:
+        stype, svals, sname = ('get_siginfo', [v.strip() for v in args.sig.split(",")], "SIGNATURE") if args.sig else ('get_taginfo', [v.strip() for v in args.tag.split(",")], "TAG")
     
-    stype, svals, sname = ('get_siginfo', [v.strip() for v in args.sig.split(",")], "SIGNATURE") if args.sig else ('get_taginfo', [v.strip() for v in args.tag.split(",")], "TAG")
+    api_key = get_api_key(args.api_key)
     
     downloader = MalwareDownloader(
         api_key=api_key,
