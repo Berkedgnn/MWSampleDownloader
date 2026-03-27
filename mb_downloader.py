@@ -22,6 +22,7 @@ class MalwareDownloader:
         self.date_range = date_range
         self.no_dupes = no_dupes
         
+        # Uzantıları ayarla ve "imphash/pe" kısayolunu akıllıca genişlet
         if extensions:
             self.allowed_extensions = [ext.strip().lower() for ext in extensions.split(",")]
             if "imphash" in self.allowed_extensions or "pe" in self.allowed_extensions:
@@ -59,7 +60,7 @@ class MalwareDownloader:
     def _setup_directories(self):
         if not os.path.exists(self.output_dir): 
             os.makedirs(self.output_dir)
-        self.day_folder = os.path.join(self.output_dir, f"download_date_{self.today_str}")
+        self.day_folder = os.path.join(self.output_dir, self.today_str)
         if not os.path.exists(self.day_folder): 
             os.makedirs(self.day_folder)
 
@@ -82,6 +83,10 @@ class MalwareDownloader:
 
     def run_legacy(self, search_type, search_values, search_name):
         for val in search_values:
+            target_dir = os.path.join(self.day_folder, val)
+            if not os.path.exists(target_dir): 
+                os.makedirs(target_dir)
+            
             data = {'query': search_type, 'limit': self.limit}
             if search_type == 'get_taginfo': 
                 data['tag'] = val
@@ -96,14 +101,6 @@ class MalwareDownloader:
                     h = entry['sha256_hash']
                     sig = entry.get('signature', 'Unknown')
                     f_type = entry.get('file_type', 'Unknown').lower()
-                    
-                    first_seen = entry.get('first_seen', '')
-                    malware_date = first_seen.split(' ')[0] if first_seen else 'Unknown_Date'
-                    folder_prefix = f"malware_date_{malware_date}" if malware_date != 'Unknown_Date' else 'Unknown_Date'
-                    
-                    target_dir = os.path.join(self.day_folder, folder_prefix, val)
-                    if not os.path.exists(target_dir): 
-                        os.makedirs(target_dir)
                     
                     if self.allowed_extensions and f_type not in self.allowed_extensions:
                         continue
@@ -130,15 +127,11 @@ class MalwareDownloader:
         current_date = self.start_dt
         while current_date <= self.end_dt:
             date_str = current_date.strftime("%Y-%m-%d")
-            
-            malware_date_folder = os.path.join(self.day_folder, f"malware_date_{date_str}")
-            if not os.path.exists(malware_date_folder):
-                os.makedirs(malware_date_folder)
-                
             print(f"\n[*] Processing Daily Batch: {date_str}")
             
-            batch_url = f"https://mb-api.abuse.ch/downloads/{date_str}.zip"
-            batch_zip_path = os.path.join(malware_date_folder, f"batch_{date_str}.zip")
+            # --- SENİN VERDİĞİN LİNK BURADA ---
+            batch_url = f"https://datalake.abuse.ch/malware-bazaar/daily/{date_str}.zip"
+            batch_zip_path = os.path.join(self.day_folder, f"batch_{date_str}.zip")
             
             print(f"[*] Downloading massive payload batch from {batch_url} ...")
             try:
@@ -150,10 +143,23 @@ class MalwareDownloader:
                         current_date += timedelta(days=1)
                         continue
                         
+                    # İndirme boyutunu doğrulamak için total size'ı çekiyoruz (Traceback'i engellemek için)
+                    total_size_in_bytes = int(r.headers.get('content-length', 0))
+                    downloaded_size = 0
+                        
                     with open(batch_zip_path, 'wb') as f:
                         for chunk in r.iter_content(chunk_size=8192): 
                             if chunk:
                                 f.write(chunk)
+                                downloaded_size += len(chunk)
+                                
+                    # İndirme boyutu eksikse arşivi açmaya çalışmadan direkt silip atla
+                    if total_size_in_bytes != 0 and downloaded_size < total_size_in_bytes:
+                        print(f"[-] ERROR: Download incomplete. Expected {total_size_in_bytes} bytes, got {downloaded_size} bytes.")
+                        os.remove(batch_zip_path)
+                        current_date += timedelta(days=1)
+                        continue
+                        
             except Exception as e:
                 print(f"[-] Download failed: {e}")
                 current_date += timedelta(days=1)
@@ -170,12 +176,14 @@ class MalwareDownloader:
                         total_files = len(file_list)
                         
                         for i, filename in enumerate(file_list):
+                            # --- YESIL PROGRESS BAR ---
                             percent = (i + 1) / total_files
                             bar_length = 40
                             filled_length = int(bar_length * percent)
                             bar = '█' * filled_length + '-' * (bar_length - filled_length)
                             sys.stdout.write(f'\r\033[92m[*] Analyzing Magic Bytes: |{bar}| {percent:.1%} ({i+1}/{total_files})\033[0m')
                             sys.stdout.flush()
+                            # --------------------------
 
                             sha256_hash = filename.split('.')[0]
                             
@@ -191,13 +199,14 @@ class MalwareDownloader:
                             except Exception:
                                 pass
                                 
+                            # Imphash/PE dosyaları hedeflendiyse MZ başlığı olmayanları atla
                             if self.allowed_extensions:
                                 pe_targets = ['exe', 'dll', 'sys', 'ocx', 'imphash', 'pe']
                                 if any(ext in self.allowed_extensions for ext in pe_targets):
                                     if not is_pe:
                                         continue
                                         
-                            target_dir = os.path.join(malware_date_folder, search_values[0])
+                            target_dir = os.path.join(self.day_folder, search_values[0])
                             if not os.path.exists(target_dir): 
                                 os.makedirs(target_dir)
                             
@@ -219,7 +228,7 @@ class MalwareDownloader:
                         print() 
                                 
                 except zipfile.BadZipFile:
-                     print("\n[-] ERROR: Downloaded massive batch is corrupted.")
+                     print("\n[-] ERROR: Downloaded massive batch is corrupted (BadZipFile). Skipping...")
                      
                 try:
                     os.remove(batch_zip_path)
