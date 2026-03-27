@@ -137,7 +137,7 @@ class MalwareDownloader:
                 
             print(f"\n[*] Processing Daily Batch: {date_str}")
             
-            batch_url = f"https://datalake.abuse.ch/malware-bazaar/daily/{date_str}.zip"
+            batch_url = f"https://mb-api.abuse.ch/downloads/{date_str}.zip"
             batch_zip_path = os.path.join(malware_date_folder, f"batch_{date_str}.zip")
             
             print(f"[*] Downloading massive payload batch from {batch_url} ...")
