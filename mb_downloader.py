@@ -60,7 +60,7 @@ class MalwareDownloader:
     def _setup_directories(self):
         if not os.path.exists(self.output_dir): 
             os.makedirs(self.output_dir)
-        self.day_folder = os.path.join(self.output_dir, f"download_date_{self.today_str}")
+        self.day_folder = os.path.join(self.output_dir, self.today_str)
         if not os.path.exists(self.day_folder): 
             os.makedirs(self.day_folder)
 
@@ -83,6 +83,10 @@ class MalwareDownloader:
 
     def run_legacy(self, search_type, search_values, search_name):
         for val in search_values:
+            target_dir = os.path.join(self.day_folder, val)
+            if not os.path.exists(target_dir): 
+                os.makedirs(target_dir)
+            
             data = {'query': search_type, 'limit': self.limit}
             if search_type == 'get_taginfo': 
                 data['tag'] = val
@@ -97,14 +101,6 @@ class MalwareDownloader:
                     h = entry['sha256_hash']
                     sig = entry.get('signature', 'Unknown')
                     f_type = entry.get('file_type', 'Unknown').lower()
-                    
-                    first_seen = entry.get('first_seen', '')
-                    malware_date = first_seen.split(' ')[0] if first_seen else 'Unknown_Date'
-                    folder_prefix = f"malware_date_{malware_date}" if malware_date != 'Unknown_Date' else 'Unknown_Date'
-                    
-                    target_dir = os.path.join(self.day_folder, folder_prefix, val)
-                    if not os.path.exists(target_dir): 
-                        os.makedirs(target_dir)
                     
                     if self.allowed_extensions and f_type not in self.allowed_extensions:
                         continue
@@ -131,16 +127,14 @@ class MalwareDownloader:
         current_date = self.start_dt
         while current_date <= self.end_dt:
             date_str = current_date.strftime("%Y-%m-%d")
-            
-            malware_date_folder = os.path.join(self.day_folder, f"malware_date_{date_str}")
-            if not os.path.exists(malware_date_folder):
-                os.makedirs(malware_date_folder)
-                
             print(f"\n[*] Processing Daily Batch: {date_str}")
             
-            # --- TEK GERÇEK VE ÇALIŞAN LİNK ---
-            batch_url = f"https://mb-api.abuse.ch/downloads/{date_str}.zip"
-            batch_zip_path = os.path.join(malware_date_folder, f"batch_{date_str}.zip")
+            current_day_folder = os.path.join(self.output_dir, date_str)
+            if not os.path.exists(current_day_folder):
+                os.makedirs(current_day_folder)
+            
+            batch_url = f"https://datalake.abuse.ch/malware-bazaar/daily/{date_str}.zip"
+            batch_zip_path = os.path.join(current_day_folder, f"batch_{date_str}.zip")
             
             print(f"[*] Downloading massive payload batch from {batch_url} ...")
             try:
@@ -168,13 +162,7 @@ class MalwareDownloader:
                         continue
                         
             except Exception as e:
-                err_str = str(e)
-                # DNS VE FIREWALL HATALARINI ÖZEL OLARAK YAKALAMA
-                if "getaddrinfo" in err_str or "NameResolution" in err_str:
-                    print(f"[-] DNS/FIREWALL ERROR: Sanal makinen (TestVM) datalake.abuse.ch adresini çözemedi!")
-                    print(f"    Lütfen VM'in DNS ayarlarini (örn: 8.8.8.8) veya Firewall engellerini kontrol et.")
-                else:
-                    print(f"[-] Download failed: {e}")
+                print(f"[-] Download failed: {e}")
                 current_date += timedelta(days=1)
                 continue
             
@@ -188,15 +176,21 @@ class MalwareDownloader:
                         file_list = z.namelist()
                         total_files = len(file_list)
                         
+                        # Hedef klasörü döngü öncesi oluştur (gereksiz disk kontrolünü azaltır)
+                        target_dir = os.path.join(current_day_folder, search_values[0])
+                        if not os.path.exists(target_dir): 
+                            os.makedirs(target_dir)
+                        
                         for i, filename in enumerate(file_list):
-                            # --- YESIL PROGRESS BAR ---
-                            percent = (i + 1) / total_files
-                            bar_length = 40
-                            filled_length = int(bar_length * percent)
-                            bar = '█' * filled_length + '-' * (bar_length - filled_length)
-                            sys.stdout.write(f'\r\033[92m[*] Analyzing Magic Bytes: |{bar}| {percent:.1%} ({i+1}/{total_files})\033[0m')
-                            sys.stdout.flush()
-                            # --------------------------
+                            # --- PERFORMANS 1: Terminal Çıktısını Her 100 Dosyada Bir Güncelle ---
+                            if i % 100 == 0 or i == total_files - 1:
+                                percent = (i + 1) / total_files
+                                bar_length = 40
+                                filled_length = int(bar_length * percent)
+                                bar = '█' * filled_length + '-' * (bar_length - filled_length)
+                                sys.stdout.write(f'\r\033[92m[*] Analyzing & Extracting: |{bar}| {percent:.1%} ({i+1}/{total_files})\033[0m')
+                                sys.stdout.flush()
+                            # ----------------------------------------------------------------------
 
                             sha256_hash = filename.split('.')[0]
                             
@@ -204,38 +198,41 @@ class MalwareDownloader:
                                 continue
                                 
                             is_pe = False
+                            file_data = None
+                            
                             try:
+                                # --- PERFORMANS 2: Dosyayı Sadece Bir Kez Oku ve Çöz ---
                                 with z.open(filename) as f:
                                     header = f.read(2)
                                     if header == b'MZ':
                                         is_pe = True
-                            except Exception:
-                                pass
-                                
-                            if self.allowed_extensions:
-                                pe_targets = ['exe', 'dll', 'sys', 'ocx', 'imphash', 'pe']
-                                if any(ext in self.allowed_extensions for ext in pe_targets):
-                                    if not is_pe:
-                                        continue
                                         
-                            target_dir = os.path.join(malware_date_folder, search_values[0])
-                            if not os.path.exists(target_dir): 
-                                os.makedirs(target_dir)
-                            
-                            save_name = f"{sha256_hash}.exe" if is_pe else filename
-                            
-                            try:
-                                z.extract(filename, path=target_dir)
-                                old_path = os.path.join(target_dir, filename)
+                                    # Filtre kontrolü
+                                    if self.allowed_extensions:
+                                        pe_targets = ['exe', 'dll', 'sys', 'ocx', 'imphash', 'pe']
+                                        if any(ext in self.allowed_extensions for ext in pe_targets):
+                                            if not is_pe:
+                                                continue # PE değilse, dosyanın kalanını okumadan geç
+                                                
+                                    # Filtreyi geçtiyse dosyanın geri kalanını oku
+                                    file_data = header + f.read()
+                            except Exception:
+                                continue # Dosya okunamadıysa geç
+                                
+                            # Dosya verisi belleğe alındıysa (filtreyi geçtiyse) direkt diske yaz
+                            if file_data is not None:
+                                save_name = f"{sha256_hash}.exe" if is_pe else filename
                                 new_path = os.path.join(target_dir, save_name)
                                 
-                                if old_path != new_path and os.path.exists(old_path):
-                                    os.rename(old_path, new_path)
-                                    
-                                self._log_advanced(sha256_hash, target_dir, save_name, [search_values[0], "Unknown", "PE_File" if is_pe else "Unknown"])
-                                extracted_count += 1
-                            except Exception:
-                                pass
+                                try:
+                                    # --- PERFORMANS 3: z.extract yerine bellekteki veriyi diske yaz ---
+                                    with open(new_path, 'wb') as out_file:
+                                        out_file.write(file_data)
+                                        
+                                    self._log_advanced(sha256_hash, target_dir, save_name, [search_values[0], "Unknown", "PE_File" if is_pe else "Unknown"])
+                                    extracted_count += 1
+                                except Exception:
+                                    pass
                         
                         print() 
                                 
