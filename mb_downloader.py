@@ -6,7 +6,57 @@ import csv
 import sys
 import configparser
 import zipfile
+import concurrent.futures
 from datetime import datetime, timedelta
+
+def _worker_extract_chunk(zip_path, filenames_chunk, zip_password, allowed_extensions, target_dir, search_val):
+    results = []
+    try:
+        with pyzipper.AESZipFile(zip_path, 'r', encryption=pyzipper.WZ_AES) as z:
+            z.pwd = zip_password
+            for filename in filenames_chunk:
+                safe_filename = os.path.basename(filename)
+                if not safe_filename:
+                    continue
+                    
+                sha256_hash = safe_filename.split('.')[0]
+                is_pe = False
+                file_data = None
+                
+                try:
+                    with z.open(filename) as f:
+                        header = f.read(2)
+                        if header == b'MZ':
+                            is_pe = True
+                            
+                        if allowed_extensions:
+                            pe_targets = ['exe', 'dll', 'sys', 'ocx', 'imphash', 'pe']
+                            if any(ext in allowed_extensions for ext in pe_targets):
+                                if not is_pe:
+                                    continue
+                                    
+                        file_data = header + f.read()
+                        
+                    if file_data is not None:
+                        save_name = f"{sha256_hash}.exe" if is_pe else safe_filename
+                        new_path = os.path.join(target_dir, save_name)
+                        
+                        with open(new_path, 'wb') as out_file:
+                            out_file.write(file_data)
+                            
+                        results.append({
+                            'sha256_hash': sha256_hash,
+                            'save_name': save_name,
+                            'is_pe': is_pe,
+                            'target_dir': target_dir,
+                            'search_val': search_val
+                        })
+                except Exception as e:
+                    print(f"[-] Error extracting {filename}: {e}")
+    except Exception as e:
+        print(f"[-] Error opening zip batch: {e}")
+        
+    return results
 
 class MalwareDownloader:
     def __init__(self, api_key, output_dir, mode='legacy', limit=50, days=None, exact_date=None, date_range=None, no_dupes=False, extensions=None):
@@ -22,14 +72,13 @@ class MalwareDownloader:
         self.date_range = date_range
         self.no_dupes = no_dupes
         
-        # Uzantıları ayarla ve "imphash/pe" kısayolunu akıllıca genişlet
         if extensions:
             self.allowed_extensions = [ext.strip().lower() for ext in extensions.split(",")]
             if "imphash" in self.allowed_extensions or "pe" in self.allowed_extensions:
                 self.allowed_extensions.extend(["exe", "dll", "sys", "ocx"])
         else:
             self.allowed_extensions = None
-        
+            
         self.start_dt = None
         self.end_dt = None
         self._parse_dates()
@@ -45,7 +94,10 @@ class MalwareDownloader:
             self._load_history()
 
     def _parse_dates(self):
-        if self.date_range:
+        if self.days:
+            self.end_dt = datetime.now().replace(hour=23, minute=59, second=59)
+            self.start_dt = (self.end_dt - timedelta(days=self.days)).replace(hour=0, minute=0, second=0)
+        elif self.date_range:
             try:
                 start_str, end_str = self.date_range.split(":")
                 self.start_dt = datetime.strptime(start_str.strip(), "%Y-%m-%d")
@@ -80,6 +132,16 @@ class MalwareDownloader:
             if not file_exists:
                 writer.writerow(['Date/Time', 'Search Value', 'Family (Signature)', 'SHA256 Hash', 'Saved File Path', 'File Type', 'YARA Rules'])
             writer.writerow(row_data)
+
+    def _save_to_csv_bulk(self, rows_data):
+        if not rows_data:
+            return
+        file_exists = os.path.exists(self.csv_log_file)
+        with open(self.csv_log_file, mode='a', newline='', encoding='utf-8') as f:
+            writer = csv.writer(f)
+            if not file_exists:
+                writer.writerow(['Date/Time', 'Search Value', 'Family (Signature)', 'SHA256 Hash', 'Saved File Path', 'File Type', 'YARA Rules'])
+            writer.writerows(rows_data)
 
     def run_legacy(self, search_type, search_values, search_name):
         for val in search_values:
@@ -121,7 +183,7 @@ class MalwareDownloader:
 
     def run_advanced(self, search_values, search_name):
         if not self.start_dt:
-            print("[-] ERROR: Advanced mode requires a --date or --date-range to be set.")
+            print("[-] ERROR: Advanced mode requires a --date, --days or --date-range to be set.")
             sys.exit(1)
             
         current_date = self.start_dt
@@ -172,77 +234,86 @@ class MalwareDownloader:
                 try:
                     with pyzipper.AESZipFile(batch_zip_path, 'r', encryption=pyzipper.WZ_AES) as z:
                         z.pwd = self.zip_password
+                        full_file_list = z.namelist()
+                    
+                    tasks = []
+                    for filename in full_file_list:
+                        sha256 = os.path.basename(filename).split('.')[0]
+                        if self.no_dupes and sha256 in self.downloaded_history:
+                            continue
+                        tasks.append(filename)
                         
-                        file_list = z.namelist()
-                        total_files = len(file_list)
-                        
-                        # Hedef klasörü döngü öncesi oluştur (gereksiz disk kontrolünü azaltır)
+                    total_tasks = len(tasks)
+                    
+                    if total_tasks > 0:
                         target_dir = os.path.join(current_day_folder, search_values[0])
                         if not os.path.exists(target_dir): 
                             os.makedirs(target_dir)
+                            
+                        cpu_count = os.cpu_count() or 4
+                        print(f"[*] Firing up {cpu_count} CPU cores for parallel extraction...")
                         
-                        for i, filename in enumerate(file_list):
-                            # --- PERFORMANS 1: Terminal Çıktısını Her 100 Dosyada Bir Güncelle ---
-                            if i % 100 == 0 or i == total_files - 1:
-                                percent = (i + 1) / total_files
+                        chunk_size = 250
+                        chunks = [tasks[i:i + chunk_size] for i in range(0, total_tasks, chunk_size)]
+                        total_chunks = len(chunks)
+                        
+                        all_csv_rows = []
+
+                        with concurrent.futures.ProcessPoolExecutor() as executor:
+                            futures = {
+                                executor.submit(
+                                    _worker_extract_chunk, 
+                                    batch_zip_path, 
+                                    chunk, 
+                                    self.zip_password, 
+                                    self.allowed_extensions, 
+                                    target_dir, 
+                                    search_values[0]
+                                ): chunk for chunk in chunks
+                            }
+                            
+                            for i, future in enumerate(concurrent.futures.as_completed(futures)):
+                                percent = (i + 1) / total_chunks
                                 bar_length = 40
                                 filled_length = int(bar_length * percent)
                                 bar = '█' * filled_length + '-' * (bar_length - filled_length)
-                                sys.stdout.write(f'\r\033[92m[*] Analyzing & Extracting: |{bar}| {percent:.1%} ({i+1}/{total_files})\033[0m')
+                                sys.stdout.write(f'\r\033[92m[*] Parallelling Extraction: |{bar}| {percent:.1%} ({i+1}/{total_chunks} chunks)\033[0m')
                                 sys.stdout.flush()
-                            # ----------------------------------------------------------------------
-
-                            sha256_hash = filename.split('.')[0]
-                            
-                            if self.no_dupes and sha256_hash in self.downloaded_history:
-                                continue
                                 
-                            is_pe = False
-                            file_data = None
-                            
-                            try:
-                                # --- PERFORMANS 2: Dosyayı Sadece Bir Kez Oku ve Çöz ---
-                                with z.open(filename) as f:
-                                    header = f.read(2)
-                                    if header == b'MZ':
-                                        is_pe = True
-                                        
-                                    # Filtre kontrolü
-                                    if self.allowed_extensions:
-                                        pe_targets = ['exe', 'dll', 'sys', 'ocx', 'imphash', 'pe']
-                                        if any(ext in self.allowed_extensions for ext in pe_targets):
-                                            if not is_pe:
-                                                continue # PE değilse, dosyanın kalanını okumadan geç
-                                                
-                                    # Filtreyi geçtiyse dosyanın geri kalanını oku
-                                    file_data = header + f.read()
-                            except Exception:
-                                continue # Dosya okunamadıysa geç
-                                
-                            # Dosya verisi belleğe alındıysa (filtreyi geçtiyse) direkt diske yaz
-                            if file_data is not None:
-                                save_name = f"{sha256_hash}.exe" if is_pe else filename
-                                new_path = os.path.join(target_dir, save_name)
-                                
-                                try:
-                                    # --- PERFORMANS 3: z.extract yerine bellekteki veriyi diske yaz ---
-                                    with open(new_path, 'wb') as out_file:
-                                        out_file.write(file_data)
-                                        
-                                    self._log_advanced(sha256_hash, target_dir, save_name, [search_values[0], "Unknown", "PE_File" if is_pe else "Unknown"])
-                                    extracted_count += 1
-                                except Exception:
-                                    pass
-                        
+                                res_list = future.result()
+                                if res_list:
+                                    for res in res_list:
+                                        ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+                                        all_csv_rows.append([
+                                            ts, 
+                                            res['search_val'], 
+                                            "Unknown", 
+                                            res['sha256_hash'], 
+                                            os.path.join(res['target_dir'], res['save_name']), 
+                                            "PE_File" if res['is_pe'] else "Unknown", 
+                                            "Batch Download"
+                                        ])
+                                        if self.no_dupes:
+                                            self.downloaded_history.add(res['sha256_hash'])
+                                    extracted_count += len(res_list)
+                                    
                         print() 
+                        
+                        if all_csv_rows:
+                            self._save_to_csv_bulk(all_csv_rows)
+                            if self.no_dupes:
+                                for row in all_csv_rows:
+                                    self._save_history(row[3])
                                 
                 except zipfile.BadZipFile:
                      print("\n[-] ERROR: Downloaded massive batch is corrupted (BadZipFile). Skipping...")
+                except Exception as e:
+                     print(f"\n[-] ERROR during extraction process: {e}")
                      
                 try:
                     os.remove(batch_zip_path)
-                except Exception:
-                    pass
+                except Exception as e:
+                    print(f"[-] Could not remove batch zip: {e}")
                     
             print(f"[+] Advanced extraction complete. Acquired {extracted_count} samples for {date_str}.")
             current_date += timedelta(days=1)
@@ -252,27 +323,31 @@ class MalwareDownloader:
             with pyzipper.AESZipFile(zip_path, 'r', compression=pyzipper.ZIP_DEFLATED, encryption=pyzipper.WZ_AES) as z:
                 z.pwd = self.zip_password
                 filenames = z.namelist()
-                z.extractall(path=target_dir)
+                
+                for filename in filenames:
+                    safe_name = os.path.basename(filename)
+                    if not safe_name: continue
+                    source = z.open(filename)
+                    target = open(os.path.join(target_dir, safe_name), "wb")
+                    with source, target:
+                        import shutil
+                        shutil.copyfileobj(source, target)
                 
                 ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-                file_name = filenames[0] if filenames else sha256_hash
+                file_name = os.path.basename(filenames[0]) if filenames else sha256_hash
                 self._save_to_csv([ts, search_val, signature, sha256_hash, os.path.join(target_dir, file_name), f_type, yara_str])
                 
                 if self.no_dupes:
                     self._save_history(sha256_hash)
                     self.downloaded_history.add(sha256_hash)
-        except Exception:
-            pass
+        except Exception as e:
+            print(f"[-] Extract and log error for {sha256_hash}: {e}")
         finally:
             if os.path.exists(zip_path): 
-                os.remove(zip_path)
-            
-    def _log_advanced(self, sha256_hash, target_dir, filename, meta):
-        ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-        self._save_to_csv([ts, meta[0], meta[1], sha256_hash, os.path.join(target_dir, filename), meta[2], "Batch Download"])
-        if self.no_dupes:
-            self._save_history(sha256_hash)
-            self.downloaded_history.add(sha256_hash)
+                try:
+                    os.remove(zip_path)
+                except Exception:
+                    pass
 
 def get_api_key(args_api_key):
     config_file = "mb_config.conf"
