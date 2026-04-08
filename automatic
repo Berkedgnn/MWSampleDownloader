@@ -1,255 +1,338 @@
 import os
+import sys
 import time
 import shutil
+import re
+import csv
 import pandas as pd
 import pefile
 
-# --- KLASÖR YAPILANDIRMASI (DİNAMİK) ---
-BASE_DIR = os.getcwd() 
+# ==========================================
+# KLASÖR YAPILANDIRMASI (DİNAMİK VE GÜVENLİ)
+# ==========================================
+if getattr(sys, 'frozen', False):
+    BASE_DIR = os.path.dirname(sys.executable)
+else:
+    BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+
+# System32 koruması: Yönetici terminali yanlışlıkla System32'yi gösterirse Masaüstüne yönlendir.
+if "system32" in BASE_DIR.lower():
+    BASE_DIR = os.path.join(os.environ.get('USERPROFILE', 'C:\\'), 'Desktop', 'Malware_Pipeline')
 
 DIR_STEP1_CSV = os.path.join(BASE_DIR, "1_Adim_Output_CSV")
 DIR_STEP2_CSV = os.path.join(BASE_DIR, "2_Adim_YaraForge_CSV")
-DIR_STEP3_CSV = os.path.join(BASE_DIR, "3_Adim_Whitelist_CSV")
+DIR_STEP3_CSV = os.path.join(BASE_DIR, "3_Adim_Whitelist_Rule2_CSV")
 
 DIR_KACANLAR_1 = os.path.join(BASE_DIR, "Kacanlar_1")
 DIR_KACANLAR_2 = os.path.join(BASE_DIR, "Kacanlar_2")
-
-# Yeni İnceleme Logları Klasörü
 DIR_INCELEME_LOGLARI = os.path.join(BASE_DIR, "YaraForge_Inceleme_Loglari")
 
-# Gerekli tüm klasörleri oluştur
+# Gerekli klasörleri oluştur
 for d in [DIR_STEP1_CSV, DIR_STEP2_CSV, DIR_STEP3_CSV, DIR_KACANLAR_1, DIR_KACANLAR_2, DIR_INCELEME_LOGLARI]:
     os.makedirs(d, exist_ok=True)
 
-# --- YARDIMCI FONKSİYONLAR ---
+
+# ==========================================
+# 1. ORTAK YARDIMCI FONKSİYONLAR
+# ==========================================
 
 def get_user_paths():
-    """Kullanıcıdan ana malware, YARA ve Log dizin yollarını alır."""
-    print("="*50)
-    print(" DİZİN YAPILANDIRMASI ".center(50, "="))
-    print("="*50)
-    
-    malware_dir = input("[?] Zararlıların (Malware) bulunduğu ANA KLASÖR yolunu girin:\n>>> ").strip(' "\'')
-    yara_dir = input("\n[?] Güvenlik programının YARA KURALLARI (Yara_Dir) klasör yolunu girin:\n>>> ").strip(' "\'')
-    logs_dir = input("\n[?] Güvenlik programının LOGLARININ (logs) bulunduğu klasör yolunu girin:\n>>> ").strip(' "\'')
-    
+    print("="*60)
+    print(" DİZİN YAPILANDIRMASI ".center(60, "="))
+    print("="*60)
+    malware_dir = input("[?] Malware ana klasör yolunu giriniz:\n>>> ").strip(' "\'')
+    yara_dir = input("\n[?] YARA kuralları klasör yolunu giriniz:\n>>> ").strip(' "\'')
+    logs_dir = input("\n[?] Uygulama log klasör yolunu giriniz:\n>>> ").strip(' "\'')
     return malware_dir, yara_dir, logs_dir
 
 def set_active_yara(yara_dir, active_rule_name):
-    """Tarama programının klasöründeki YARA kurallarını yönetir."""
-    print(f"\n[*] Tarama programı dizininde YARA Kuralları ayarlanıyor... Aktif edilecek: {active_rule_name}")
-    
+    print(f"\n[*] YARA kuralı aktif ediliyor: {active_rule_name}")
     for file in os.listdir(yara_dir):
-        if file.endswith('.yara'):
+        if file.endswith(('.yara', '.yara1')):
             aktif_dosya = os.path.join(yara_dir, file)
-            pasif_dosya = os.path.join(yara_dir, file + '1')
-            os.rename(aktif_dosya, pasif_dosya)
-    
-    target_passive = os.path.join(yara_dir, active_rule_name + '.yara1')
-    target_active = os.path.join(yara_dir, active_rule_name + '.yara')
-    
-    if os.path.exists(target_passive):
-        os.rename(target_passive, target_active)
-        print(f"[+] {active_rule_name}.yara aktif edildi.")
-    elif os.path.exists(target_active):
-        print(f"[+] {active_rule_name}.yara zaten aktif.")
-    else:
-        print(f"[-] UYARI: {active_rule_name} kuralı '{yara_dir}' klasöründe bulunamadı!")
+            base_name = file.rsplit('.yara', 1)[0]
+            yeni_isim = os.path.join(yara_dir, base_name + '.yara') if base_name == active_rule_name else os.path.join(yara_dir, base_name + '.yara1')
+            
+            if aktif_dosya != yeni_isim:
+                try: os.rename(aktif_dosya, yeni_isim)
+                except: pass
+    print(f"[+] Kural ayarlandı: {active_rule_name}.yara")
 
 def wait_for_csv(folder_path, prompt_msg):
-    """İlgili klasöre bir CSV dosyası atılana kadar bekler."""
     print(f"\n[BEKLENİYOR] {prompt_msg}")
     print(f"Hedef Klasör: {folder_path}")
     while True:
         csv_files = [f for f in os.listdir(folder_path) if f.endswith('.csv')]
         if csv_files:
             time.sleep(2) 
-            target_csv = os.path.join(folder_path, csv_files[0])
-            print(f"[+] CSV algılandı: {csv_files[0]}")
-            return target_csv
+            print(f"[+] CSV dosyası algılandı: {csv_files[0]}")
+            return os.path.join(folder_path, csv_files[0])
         time.sleep(3)
 
+def copy_latest_log(logs_dir, dest_dir):
+    print(f"\n[*] Log dosyası yedekleniyor...")
+    try:
+        csv_files = []
+        for f in os.listdir(logs_dir):
+            if f.lower().endswith('.csv') and 'threats' in f.lower():
+                if not re.match(r'^\d{8}_', f):
+                    csv_files.append(os.path.join(logs_dir, f))
+        
+        if not csv_files:
+            print("[-] Uygun log dosyası bulunamadı.")
+            return None
+        
+        latest_file = max(csv_files, key=os.path.getctime)
+        hedef = os.path.join(dest_dir, os.path.basename(latest_file))
+        shutil.copy2(latest_file, hedef)
+        
+        print(f"[+] Log dosyası kopyalandı: {os.path.basename(latest_file)}")
+        return hedef
+    except Exception as e:
+        print(f"[!] Log kopyalama hatası: {e}")
+        return None
+
+
+# ==========================================
+# 2. FAZ 1: IMPHASH MANTIĞI FONKSİYONLARI
+# ==========================================
+
 def separator(csv_path, source_dir, dest_dir):
-    """CSV'deki hashleri okur, kaynak dizinde olup CSV'de olmayanları hedefe taşır."""
     df = pd.read_csv(csv_path, sep=None, engine='python')
     hash_col = 'sha256' if 'sha256' in df.columns else df.columns[0]
     bilinen_hashler = set(df[hash_col].astype(str).str.strip().str.lower())
     
-    tasinan = 0
-    toplam = 0
-    
-    print(f"[*] Ayıklama başlatıldı. {len(bilinen_hashler)} tespit kaydı okundu.")
+    tasinan = toplam = 0
+    print(f"[*] Ayıklama işlemi başlatıldı. CSV'den {len(bilinen_hashler)} kayıt okundu.")
     for root, dirs, files in os.walk(source_dir):
-        if os.path.abspath(root) == os.path.abspath(dest_dir):
-            continue
+        if os.path.abspath(root) == os.path.abspath(dest_dir): continue
         for file in files:
             if file.endswith((".csv", ".py", ".txt")): continue
             toplam += 1
-            file_hash = os.path.splitext(file)[0].lower()
-            
-            if file_hash not in bilinen_hashler:
-                kaynak = os.path.join(root, file)
-                hedef = os.path.join(dest_dir, file)
+            if os.path.splitext(file)[0].lower() not in bilinen_hashler:
                 try:
-                    shutil.move(kaynak, hedef)
+                    shutil.move(os.path.join(root, file), os.path.join(dest_dir, file))
                     tasinan += 1
-                except Exception as e:
-                    pass
-    print(f"[+] İşlem tamam. {toplam} dosyadan {tasinan} tanesi '{os.path.basename(dest_dir)}' klasörüne kaçtı.")
-
-def copy_latest_log(logs_dir, dest_dir):
-    """Logs klasöründeki en son oluşturulan CSV dosyasını inceleme klasörüne kopyalar."""
-    print(f"\n[*] '{logs_dir}' klasöründeki uygulama logu yedekleniyor...")
-    try:
-        csv_files = [os.path.join(logs_dir, f) for f in os.listdir(logs_dir) if f.endswith('.csv')]
-        if not csv_files:
-            print("[-] Logs klasöründe kopyalanacak CSV bulunamadı!")
-            return
-        
-        # En yeni (son değiştirilme tarihi en büyük olan) dosyayı bul
-        latest_file = max(csv_files, key=os.path.getctime)
-        hedef = os.path.join(dest_dir, os.path.basename(latest_file))
-        
-        shutil.copy2(latest_file, hedef)
-        print(f"[+] Log dosyası inceleme için başarıyla kopyalandı: {os.path.basename(latest_file)}")
-    except Exception as e:
-        print(f"[!] Log kopyalanırken hata oluştu: {e}")
+                except: pass
+    print(f"[+] İşlem tamamlandı. {toplam} dosyadan {tasinan} adedi '{os.path.basename(dest_dir)}' klasörüne taşındı.")
 
 def get_imphash(filepath):
     try:
         pe = pefile.PE(filepath, fast_load=True)
         pe.parse_data_directories(directories=[pefile.DIRECTORY_ENTRY["IMAGE_DIRECTORY_ENTRY_IMPORT"]])
-        imphash = pe.get_imphash()
+        ih = pe.get_imphash()
         pe.close()
-        return imphash
-    except:
-        return None
+        return ih
+    except: return None
 
 def generate_yara_rule(malware_dir, output_yara_path):
-    """Klasördeki dosyaların imphash'ini alıp rule2.yara oluşturur."""
-    print(f"\n[*] '{os.path.basename(malware_dir)}' içindeki dosyalar için YARA kuralı oluşturuluyor...")
+    print(f"\n[*] rule2.yara kuralı oluşturuluyor...")
     hashes = set()
     for root, dirs, files in os.walk(malware_dir):
         for f in files:
-            filepath = os.path.join(root, f)
-            ih = get_imphash(filepath)
-            if ih:
-                hashes.add(ih)
-    
-    if not hashes:
-        print("[-] Hiç imphash bulunamadı!")
-        return set()
+            ih = get_imphash(os.path.join(root, f))
+            if ih: hashes.add(ih)
+    if not hashes: return set()
 
     conditions = " or\n            ".join([f'pe.imphash() == "{h}"' for h in hashes])
-    rule = f"""import "pe"
-
-rule rule2_generated
-{{
-    meta:
-        description = "Kaçan malware imphashes"
-        author = "SOC Automation"
-    condition:
-        uint16(0) == 0x5A4D and
-        (
-            {conditions}
-        )
-}}"""
     with open(output_yara_path, 'w', encoding='utf-8') as f:
-        f.write(rule)
-    print(f"[+] Kural başarıyla tarama programının dizinine oluşturuldu: {output_yara_path} ({len(hashes)} unique imphash)")
+        f.write(f'import "pe"\n\nrule rule2_generated\n{{\n    condition:\n        uint16(0) == 0x5A4D and\n        (\n            {conditions}\n        )\n}}')
+    print(f"[+] Kural oluşturuldu: {output_yara_path}")
     return hashes
 
-def process_whitelist_and_clean_yara(original_hashes):
-    """Whitelist CSV'lerindeki pathleri okur, imphash hesaplar, final kuralını ana dizine çıkartır."""
-    print(f"\n[*] Whitelist CSV'leri işleniyor...")
+def process_whitelist_rule2(original_hashes):
+    print(f"\n[*] Whitelist sonuçları işleniyor...")
     whitelist_imphashes = set()
-    csv_files = [f for f in os.listdir(DIR_STEP3_CSV) if f.endswith('.csv')]
-    
-    for csv_file in csv_files:
+    for csv_file in [f for f in os.listdir(DIR_STEP3_CSV) if f.endswith('.csv')]:
         df = pd.read_csv(os.path.join(DIR_STEP3_CSV, csv_file), sep=None, engine='python')
-        path_col = None
-        for col in df.columns:
-            if 'path' in col.lower() or 'yol' in col.lower():
-                path_col = col
-                break
-        if not path_col: path_col = df.columns[0]
-        
+        path_col = next((col for col in df.columns if 'path' in col.lower() or 'yol' in col.lower()), df.columns[0])
         for path in df[path_col].dropna():
             if os.path.exists(path):
                 ih = get_imphash(path)
                 if ih: whitelist_imphashes.add(ih)
 
-    print(f"[+] Whitelist taramasında {len(whitelist_imphashes)} adet zararsız imphash tespit edildi.")
-    
     final_hashes = original_hashes - whitelist_imphashes
-    
     conditions = " or\n            ".join([f'pe.imphash() == "{h}"' for h in final_hashes])
-    rule = f"""import "pe"
-
-rule rule2_final
-{{
-    meta:
-        description = "False-Positive Arındırılmış Final Kural"
-    condition:
-        uint16(0) == 0x5A4D and
-        (
-            {conditions}
-        )
-}}"""
     final_path = os.path.join(BASE_DIR, "final_rule2.yara")
     with open(final_path, 'w', encoding='utf-8') as f:
-        f.write(rule)
-    
-    print(f"\n[🚀] SÜREÇ TAMAMLANDI!")
-    print(f"[+] Yöneticine ileteceğin temizlenmiş kural dosyası scriptin çalıştığı ana dizinde oluşturuldu: {final_path}")
-    print(f"[+] Kalan gerçek zararlı imphash sayısı: {len(final_hashes)}")
+        f.write(f'import "pe"\n\nrule rule2_final\n{{\n    condition:\n        uint16(0) == 0x5A4D and\n        (\n            {conditions}\n        )\n}}')
+    print(f"[+] FAZ 1 Tamamlandı. final_rule2.yara oluşturuldu.")
 
-# --- ANA İŞ AKIŞI (PIPELINE) ---
+
+# ==========================================
+# 3. FAZ 2: YARA-FORGE SEÇİCİ VE FP TEMİZLEYİCİ
+# ==========================================
+
+YARA_NAME_RE = re.compile(r'^[A-Za-z][A-Za-z0-9_]{4,}$')
+def looks_like_rule_name(val):
+    return bool(YARA_NAME_RE.match(val)) and '_' in val
+
+def load_threat_names_from_log(csv_path):
+    names = set()
+    with open(csv_path, newline='', encoding='utf-8-sig') as f:
+        reader = csv.DictReader(f)
+        fieldnames = reader.fieldnames or []
+        for row in reader:
+            for col in fieldnames:
+                cell = (row.get(col) or "").strip()
+                if looks_like_rule_name(cell):
+                    names.add(cell)
+                    break 
+    return names
+
+def create_secilen_kurallar(log_csv_path, yara_dir):
+    print("\n" + "-"*50)
+    print("[*] FAZ 2: Loglardan kuralların süzülmesi başlatılıyor.")
+    
+    threat_names = load_threat_names_from_log(log_csv_path)
+    print(f"[*] Log dosyasından {len(threat_names)} adet YARA kuralı tespit edildi.")
+    if not threat_names:
+        print("[-] Log dosyasında geçerli kural ismi bulunamadı.")
+        return False
+
+    forge_path = None
+    for f in os.listdir(yara_dir):
+        if f.startswith('yara-forge'):
+            forge_path = os.path.join(yara_dir, f)
+            break
+            
+    if not forge_path:
+        print("[-] Hedef dizinde 'yara-forge' kuralı bulunamadı.")
+        return False
+
+    print(f"[*] {os.path.basename(forge_path)} okunuyor...")
+    with open(forge_path, "rb") as f:
+        forge_content = f.read().replace(b"\r\n", b"\n").replace(b"\r", b"\n").decode("utf-8", errors="replace")
+
+    rule_starts = [(m.start(), m.group(1)) for m in re.finditer(r'(?m)^rule\s+(\w+)', forge_content)]
+    matched_blocks = []
+    
+    for i, (start, name) in enumerate(rule_starts):
+        if name in threat_names:
+            end = rule_starts[i + 1][0] if i + 1 < len(rule_starts) else len(forge_content)
+            matched_blocks.append(forge_content[start:end])
+
+    secilen_path = os.path.join(yara_dir, "secilen_kurallar.yara1")
+    with open(secilen_path, "w", encoding="utf-8") as f:
+        f.write("/* Otomatik Suzulen Kurallar */\n\n")
+        imports = set(re.findall(r'^import\s+"[^"]+"', forge_content[:10000], re.MULTILINE))
+        for imp in imports: f.write(imp + "\n")
+        f.write("\n")
+        for block in matched_blocks: f.write(block.rstrip() + "\n\n")
+
+    print(f"[+] {len(matched_blocks)} adet kural 'secilen_kurallar.yara' dosyasına aktarıldı.")
+    return True
+
+def remove_fp_from_secilen_kurallar(yara_dir):
+    print("\n" + "-"*50)
+    print("[*] Kural Temizliği (False Positive) işlemi başlatılıyor.")
+    
+    silinecek_kurallar = set()
+    while True:
+        kural = input("\n[?] Hatalı (False Positive) kural adını giriniz (İşlemi sonlandırmak için 'bitti' yazınız):\n>>> ").strip()
+        if not kural or kural.lower() in ['bitti', 'h', 'hayır', 'hayir']:
+            break
+        silinecek_kurallar.add(kural)
+    
+    if not silinecek_kurallar:
+        print("[+] Hatalı kural girilmedi. İşlem sonlandırılıyor.")
+        return
+        
+    print(f"\n[*] Silinecek kurallar: {', '.join(silinecek_kurallar)}")
+    
+    secilen_path = None
+    for f in os.listdir(yara_dir):
+        if f.startswith('secilen_kurallar'):
+            secilen_path = os.path.join(yara_dir, f)
+            break
+            
+    if not secilen_path: return
+
+    with open(secilen_path, 'r', encoding='utf-8') as f:
+        lines = f.readlines()
+
+    yeni_satirlar = []
+    atla_modu = False
+    parantez_sayaci = 0
+
+    for line in lines:
+        if not atla_modu:
+            kelimeler = line.split()
+            if len(kelimeler) >= 2 and kelimeler[0] == "rule":
+                kural_adi = kelimeler[1].strip("{:")
+                if kural_adi in silinecek_kurallar:
+                    atla_modu = True
+                    parantez_sayaci = line.count("{") - line.count("}")
+                    continue
+            yeni_satirlar.append(line)
+        else:
+            parantez_sayaci += line.count("{")
+            parantez_sayaci -= line.count("}")
+            if parantez_sayaci <= 0:
+                atla_modu = False
+
+    final_yara_path = os.path.join(BASE_DIR, "final_secilen_kurallar.yara")
+    with open(final_yara_path, 'w', encoding='utf-8') as f:
+        f.writelines(yeni_satirlar)
+        
+    print(f"[+] Hatalı kurallar dosyadan silindi.")
+    print(f"[+] Temizlenmiş YARA dosyası oluşturuldu: {final_yara_path}")
+
+
+# ==========================================
+# ANA İŞ AKIŞI (PIPELINE)
+# ==========================================
 def main():
-    # 0. ADIM: Yolları Kullanıcıdan Al
     malware_ana_dizin, yara_dir, logs_dir = get_user_paths()
 
-    # Dizin kontrolü
     hatali_dizin = False
     for d_path, d_name in [(malware_ana_dizin, "Malware"), (yara_dir, "YARA"), (logs_dir, "Logs")]:
         if not os.path.exists(d_path):
-            print(f"\n[HATA] Girdiğiniz {d_name} dizini bulunamadı: {d_path}")
+            print(f"\n[HATA] Belirtilen dizin bulunamadı: {d_path}")
             hatali_dizin = True
-    
-    if hatali_dizin:
-        print("Lütfen programı yeniden başlatıp doğru yolları girin.")
-        return
+    if hatali_dizin: return
 
     print("\n" + "="*50)
-    print(" MALWARE OTOMASYON BORU HATTI BAŞLIYOR ".center(50, "="))
+    print(" İŞLEM BAŞLATILIYOR ".center(50, "="))
     print("="*50)
 
-    # 1. ADIM: Output.yara
+    # --- FAZ 1: IMPHASH SÜRECİ ---
     set_active_yara(yara_dir, "output")
-    csv1 = wait_for_csv(DIR_STEP1_CSV, "Güvenlik ürünü ile ana dizini tara. Çıkan CSV'yi 1_Adim_Output_CSV klasörüne at.")
+    csv1 = wait_for_csv(DIR_STEP1_CSV, "Lütfen output.yara tarama sonucunu '1_Adim_Output_CSV' klasörüne kopyalayınız.")
     separator(csv1, malware_ana_dizin, DIR_KACANLAR_1)
 
-    # 2. ADIM: yara-forge.yara
     set_active_yara(yara_dir, "yara-forge")
-    csv2 = wait_for_csv(DIR_STEP2_CSV, "Kacanlar_1 klasörünü yara-forge kuralı ile tara. Çıkan CSV'yi 2_Adim_YaraForge_CSV klasörüne at.")
+    csv2 = wait_for_csv(DIR_STEP2_CSV, "Lütfen yara-forge.yara tarama sonucunu '2_Adim_YaraForge_CSV' klasörüne kopyalayınız.")
     separator(csv2, DIR_KACANLAR_1, DIR_KACANLAR_2)
     
-    # [YENİ] 2. Adım Sonrası Log Yedekleme İşlemi
-    copy_latest_log(logs_dir, DIR_INCELEME_LOGLARI)
+    yedeklenen_log = copy_latest_log(logs_dir, DIR_INCELEME_LOGLARI)
 
-    # 3. ADIM: Rule2 Üretimi ve Whitelist Taraması
     rule2_path = os.path.join(yara_dir, "rule2.yara1") 
     original_hashes = generate_yara_rule(DIR_KACANLAR_2, rule2_path)
     
     set_active_yara(yara_dir, "rule2") 
+    print(f"\n[BEKLEMEDE] rule2.yara kuralı aktif.")
+    print("Lütfen rule2.yara ile Whitelist taramasını gerçekleştiriniz.")
+    print("Tarama sonucunu (CSV) '3_Adim_Whitelist_Rule2_CSV' klasörüne kopyalayınız.")
+    input("İşlemi tamamladıktan sonra devam etmek için ENTER tuşuna basınız...")
     
-    print(f"\n[DURAKLATILDI] rule2.yara dosyası '{yara_dir}' dizininde aktif edildi.")
-    print("Lütfen bu kural ile tarama programından C:\\Windows ve Program Files gibi yerlerde Whitelist taraması yap.")
-    print("Çıkan tüm CSV dosyalarını '3_Adim_Whitelist_CSV' klasörüne at.")
-    input("CSV'leri attıktan sonra devam etmek için ENTER tuşuna bas...")
+    process_whitelist_rule2(original_hashes)
     
-    # 4. ADIM: Whitelist Temizliği
-    process_whitelist_and_clean_yara(original_hashes)
+    # --- FAZ 2: FORGE KURAL SÜZME VE TEMİZLEME SÜRECİ ---
+    if yedeklenen_log:
+        basarili = create_secilen_kurallar(yedeklenen_log, yara_dir)
+        if basarili:
+            set_active_yara(yara_dir, "secilen_kurallar")
+            
+            print(f"\n[BEKLEMEDE] secilen_kurallar.yara kuralı aktif.")
+            print("Lütfen secilen_kurallar.yara ile Whitelist taramasını gerçekleştiriniz.")
+            input("Tarama tamamlandıktan sonra devam etmek için ENTER tuşuna basınız...")
+            
+            remove_fp_from_secilen_kurallar(yara_dir)
+    else:
+        print("\n[-] Uygulama logu kopyalanamadığı için Faz 2'ye geçilemedi.")
+
+    print(f"\n[+] İŞLEMLER BAŞARIYLA TAMAMLANDI. Çıktı Dizini: {BASE_DIR}")
 
 if __name__ == "__main__":
     main()
