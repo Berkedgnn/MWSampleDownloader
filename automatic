@@ -4,8 +4,14 @@ import time
 import shutil
 import re
 import csv
+import json
+import math
+import hashlib
 import pandas as pd
 import pefile
+from datetime import datetime, timezone
+from dataclasses import dataclass, field, asdict
+from typing import Optional
 
 # ==========================================
 # KLASÖR YAPILANDIRMASI (DİNAMİK VE GÜVENLİ)
@@ -15,7 +21,6 @@ if getattr(sys, 'frozen', False):
 else:
     BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 
-# System32 koruması: Yönetici terminali yanlışlıkla System32'yi gösterirse Masaüstüne yönlendir.
 if "system32" in BASE_DIR.lower():
     BASE_DIR = os.path.join(os.environ.get('USERPROFILE', 'C:\\'), 'Desktop', 'Malware_Pipeline')
 
@@ -27,7 +32,6 @@ DIR_KACANLAR_1 = os.path.join(BASE_DIR, "Kacanlar_1")
 DIR_KACANLAR_2 = os.path.join(BASE_DIR, "Kacanlar_2")
 DIR_INCELEME_LOGLARI = os.path.join(BASE_DIR, "YaraForge_Inceleme_Loglari")
 
-# Gerekli klasörleri oluştur
 for d in [DIR_STEP1_CSV, DIR_STEP2_CSV, DIR_STEP3_CSV, DIR_KACANLAR_1, DIR_KACANLAR_2, DIR_INCELEME_LOGLARI]:
     os.makedirs(d, exist_ok=True)
 
@@ -52,7 +56,6 @@ def set_active_yara(yara_dir, active_rule_name):
             aktif_dosya = os.path.join(yara_dir, file)
             base_name = file.rsplit('.yara', 1)[0]
             yeni_isim = os.path.join(yara_dir, base_name + '.yara') if base_name == active_rule_name else os.path.join(yara_dir, base_name + '.yara1')
-            
             if aktif_dosya != yeni_isim:
                 try: os.rename(aktif_dosya, yeni_isim)
                 except: pass
@@ -77,31 +80,22 @@ def copy_latest_log(logs_dir, dest_dir):
             if f.lower().endswith('.csv') and 'threats' in f.lower():
                 if not re.match(r'^\d{8}_', f):
                     csv_files.append(os.path.join(logs_dir, f))
-        
         if not csv_files:
             print("[-] Uygun log dosyası bulunamadı.")
             return None
-        
         latest_file = max(csv_files, key=os.path.getctime)
         hedef = os.path.join(dest_dir, os.path.basename(latest_file))
         shutil.copy2(latest_file, hedef)
-        
         print(f"[+] Log dosyası kopyalandı: {os.path.basename(latest_file)}")
         return hedef
     except Exception as e:
         print(f"[!] Log kopyalama hatası: {e}")
         return None
 
-
-# ==========================================
-# 2. FAZ 1: IMPHASH MANTIĞI FONKSİYONLARI
-# ==========================================
-
 def separator(csv_path, source_dir, dest_dir):
     df = pd.read_csv(csv_path, sep=None, engine='python')
     hash_col = 'sha256' if 'sha256' in df.columns else df.columns[0]
     bilinen_hashler = set(df[hash_col].astype(str).str.strip().str.lower())
-    
     tasinan = toplam = 0
     print(f"[*] Ayıklama işlemi başlatıldı. CSV'den {len(bilinen_hashler)} kayıt okundu.")
     for root, dirs, files in os.walk(source_dir):
@@ -116,7 +110,198 @@ def separator(csv_path, source_dir, dest_dir):
                 except: pass
     print(f"[+] İşlem tamamlandı. {toplam} dosyadan {tasinan} adedi '{os.path.basename(dest_dir)}' klasörüne taşındı.")
 
-def get_imphash(filepath):
+# ==========================================
+# 2. FAZ 1: GELİŞMİŞ IMPHASH MANTIĞI (imphashfindv1.py'den)
+# ==========================================
+
+PE_EXTENSIONS = {".exe", ".dll", ".sys", ".scr", ".ocx", ".cpl", ".drv"}
+ENTROPY_THRESHOLD = 8.0          
+MAX_HASHES_PER_RULE = 150        
+DEFAULT_FILESIZE_LIMIT = "10MB"  
+
+@dataclass
+class SectionInfo:
+    name: str
+    entropy: float
+    raw_size: int
+    virtual_size: int
+    is_suspicious: bool
+
+@dataclass
+class SampleAnalysis:
+    filename: str
+    filepath: str
+    sha256: str
+    md5: str
+    imphash: Optional[str]
+    filesize: int
+    compile_timestamp: Optional[str]
+    sections: list = field(default_factory=list)
+    max_entropy: float = 0.0
+    is_likely_packed: bool = False
+    num_sections: int = 0
+    warnings: list = field(default_factory=list)
+
+def compute_file_hashes(filepath: str) -> tuple[str, str]:
+    sha256 = hashlib.sha256()
+    md5 = hashlib.md5()
+    with open(filepath, "rb") as f:
+        for chunk in iter(lambda: f.read(8192), b""):
+            sha256.update(chunk)
+            md5.update(chunk)
+    return sha256.hexdigest(), md5.hexdigest()
+
+def analyze_sections(pe: pefile.PE) -> list[SectionInfo]:
+    sections = []
+    for section in pe.sections:
+        try: name = section.Name.decode("utf-8", errors="replace").strip("\x00")
+        except: name = "<unknown>"
+        entropy = section.get_entropy()
+        sections.append(SectionInfo(
+            name=name, entropy=round(entropy, 4), raw_size=section.SizeOfRawData,
+            virtual_size=section.Misc_VirtualSize, is_suspicious=entropy >= ENTROPY_THRESHOLD,
+        ))
+    return sections
+
+def get_compile_timestamp(pe: pefile.PE) -> Optional[str]:
+    try:
+        ts = pe.FILE_HEADER.TimeDateStamp
+        if ts and ts > 0:
+            dt = datetime.fromtimestamp(ts, tz=timezone.utc)
+            if dt.year < 1990 or dt.year > 2030:
+                return f"{dt.isoformat()} [SUSPICIOUS_TIMESTAMP]"
+            return dt.isoformat()
+    except: pass
+    return None
+
+def is_pe_extension(filepath: str) -> bool:
+    _, ext = os.path.splitext(filepath)
+    return ext.lower() in PE_EXTENSIONS
+
+def analyze_sample(filepath: str) -> Optional[SampleAnalysis]:
+    filename = os.path.basename(filepath)
+    if not is_pe_extension(filepath): return None
+    
+    try: sha256, md5 = compute_file_hashes(filepath)
+    except: return None
+    filesize = os.path.getsize(filepath)
+    
+    try: pe = pefile.PE(filepath)
+    except: return None
+    
+    try: imphash = pe.get_imphash()
+    except: imphash = None
+    
+    sections = analyze_sections(pe)
+    max_entropy = max((s.entropy for s in sections), default=0.0)
+    suspicious_sections = [s for s in sections if s.is_suspicious]
+    compile_ts = get_compile_timestamp(pe)
+    
+    warnings = []
+    if not imphash: warnings.append("NO_IMPHASH")
+    if suspicious_sections: warnings.append("HIGH_ENTROPY_SECTIONS")
+    if compile_ts and "SUSPICIOUS_TIMESTAMP" in (compile_ts or ""): warnings.append("ANOMALOUS_COMPILE_TIMESTAMP")
+    if len(sections) <= 1: warnings.append("LOW_SECTION_COUNT")
+    
+    pe.close()
+    return SampleAnalysis(
+        filename=filename, filepath=filepath, sha256=sha256, md5=md5, imphash=imphash,
+        filesize=filesize, compile_timestamp=compile_ts, sections=[asdict(s) for s in sections],
+        max_entropy=round(max_entropy, 4), is_likely_packed=len(suspicious_sections) > 0,
+        num_sections=len(sections), warnings=warnings,
+    )
+
+def scan_directory(directory: str) -> list[SampleAnalysis]:
+    results = []
+    print(f"[*] Kapsamlı tarama ve Entropy analizi başlatılıyor: {directory}")
+    for root, _, files in os.walk(directory):
+        for fname in files:
+            fpath = os.path.join(root, fname)
+            analysis = analyze_sample(fpath)
+            if analysis: results.append(analysis)
+    return results
+
+# Kurallara hiç dokunulmadı, orijinal formatı birebir korundu
+def create_yara_rules(analyses: list[SampleAnalysis], rule_prefix: str, output_path: str, filesize_limit: str, exclude_packed: bool = False) -> None:
+    hash_sources = []
+    packed_hashes = set()
+    clean_hashes = set()
+    
+    for a in analyses:
+        if not a.imphash: continue
+        if a.is_likely_packed: packed_hashes.add(a.imphash)
+        else: clean_hashes.add(a.imphash)
+
+    if exclude_packed: target_hashes = sorted(clean_hashes - packed_hashes)
+    else: target_hashes = sorted(clean_hashes | packed_hashes)
+
+    if not target_hashes:
+        print("[-] Hiç geçerli imphash bulunamadı! YARA kuralı oluşturulamıyor.")
+        return
+
+    chunks = [target_hashes[i : i + MAX_HASHES_PER_RULE] for i in range(0, len(target_hashes), MAX_HASHES_PER_RULE)]
+    rules = []
+    generation_date = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+
+    for idx, chunk in enumerate(chunks):
+        rule_name = rule_prefix if len(chunks) == 1 else f"{rule_prefix}_Part{idx + 1}"
+        hash_lines = [f'            pe.imphash() == "{h}"' for h in chunk]
+        hash_condition = " or\n".join(hash_lines)
+
+        rule = f'''import "pe"
+
+rule {rule_name}
+{{
+    meta:
+        description = "Automated imphash detection - {len(chunk)} unique hashes (Part {idx+1}/{len(chunks)})"
+        author = "Onur Atali - Imphash Harvester v2.0"
+        date = "{generation_date}"
+        severity = "Critical"
+        total_samples_analyzed = "{len(analyses)}"
+        packed_samples_found = "{sum(1 for a in analyses if a.is_likely_packed)}"
+        hash_count = "{len(chunk)}"
+
+    condition:
+        uint16(0) == 0x5A4D and
+        filesize < {filesize_limit} and
+        pe.number_of_signatures == 0 and
+        (
+{hash_condition}
+        )
+}}'''
+        rules.append(rule)
+
+    packed_only = sorted(packed_hashes - clean_hashes) if exclude_packed else []
+    if packed_only:
+        hash_lines = [f'            pe.imphash() == "{h}"' for h in packed_only]
+        hash_condition = " or\n".join(hash_lines)
+        packed_rule = f'''import "pe"
+
+rule {rule_prefix}_Packed_Suspicious
+{{
+    meta:
+        description = "Suspicious packed/crypted samples - {len(packed_only)} imphashes with high section entropy"
+        author = "Onur Atali - Imphash Harvester v2.0"
+        date = "{generation_date}"
+        severity = "High"
+        note = "Bu hash'ler yüksek entropili section'lardan geldiği için FP riski taşır"
+
+    condition:
+        uint16(0) == 0x5A4D and
+        filesize < {filesize_limit} and
+        pe.number_of_signatures == 0 and
+        (
+{hash_condition}
+        )
+}}'''
+        rules.append(packed_rule)
+
+    with open(output_path, "w", encoding="utf-8") as f:
+        f.write("\n\n".join(rules))
+    print(f"[+] Orijinal formatta YARA kuralı oluşturuldu: {output_path} ({len(rules)} parça)")
+
+def get_simple_imphash(filepath):
+    """Sadece whitelist taramasındaki masum dosyaların hızlıca hash'ini almak için hafif fonksiyon"""
     try:
         pe = pefile.PE(filepath, fast_load=True)
         pe.parse_data_directories(directories=[pefile.DIRECTORY_ENTRY["IMAGE_DIRECTORY_ENTRY_IMPORT"]])
@@ -125,38 +310,24 @@ def get_imphash(filepath):
         return ih
     except: return None
 
-def generate_yara_rule(malware_dir, output_yara_path):
-    print(f"\n[*] rule2.yara kuralı oluşturuluyor...")
-    hashes = set()
-    for root, dirs, files in os.walk(malware_dir):
-        for f in files:
-            ih = get_imphash(os.path.join(root, f))
-            if ih: hashes.add(ih)
-    if not hashes: return set()
-
-    conditions = " or\n            ".join([f'pe.imphash() == "{h}"' for h in hashes])
-    with open(output_yara_path, 'w', encoding='utf-8') as f:
-        f.write(f'import "pe"\n\nrule rule2_generated\n{{\n    condition:\n        uint16(0) == 0x5A4D and\n        (\n            {conditions}\n        )\n}}')
-    print(f"[+] Kural oluşturuldu: {output_yara_path}")
-    return hashes
-
-def process_whitelist_rule2(original_hashes):
-    print(f"\n[*] Whitelist sonuçları işleniyor...")
+def process_whitelist_rule2(analyses: list[SampleAnalysis]):
+    print(f"\n[*] Whitelist sonuçları işleniyor (Gelişmiş Kural Temizliği)...")
     whitelist_imphashes = set()
     for csv_file in [f for f in os.listdir(DIR_STEP3_CSV) if f.endswith('.csv')]:
         df = pd.read_csv(os.path.join(DIR_STEP3_CSV, csv_file), sep=None, engine='python')
         path_col = next((col for col in df.columns if 'path' in col.lower() or 'yol' in col.lower()), df.columns[0])
         for path in df[path_col].dropna():
             if os.path.exists(path):
-                ih = get_imphash(path)
+                ih = get_simple_imphash(path)
                 if ih: whitelist_imphashes.add(ih)
 
-    final_hashes = original_hashes - whitelist_imphashes
-    conditions = " or\n            ".join([f'pe.imphash() == "{h}"' for h in final_hashes])
+    # Orijinal analiz listesinden, Whitelist'te patlayanları (masumları) çıkar
+    clean_analyses = [a for a in analyses if a.imphash and a.imphash not in whitelist_imphashes]
     final_path = os.path.join(BASE_DIR, "final_rule2.yara")
-    with open(final_path, 'w', encoding='utf-8') as f:
-        f.write(f'import "pe"\n\nrule rule2_final\n{{\n    condition:\n        uint16(0) == 0x5A4D and\n        (\n            {conditions}\n        )\n}}')
-    print(f"[+] FAZ 1 Tamamlandı. final_rule2.yara oluşturuldu.")
+    
+    # Temizlenmiş liste ile orijinal gelişmiş kuralı tekrar oluştur
+    create_yara_rules(clean_analyses, "rule2_final", final_path, DEFAULT_FILESIZE_LIMIT)
+    print(f"[+] FAZ 1 Tamamlandı. Gelişmiş final_rule2.yara oluşturuldu.")
 
 
 # ==========================================
@@ -238,8 +409,6 @@ def remove_fp_from_secilen_kurallar(yara_dir):
         print("[+] Hatalı kural girilmedi. İşlem sonlandırılıyor.")
         return
         
-    print(f"\n[*] Silinecek kurallar: {', '.join(silinecek_kurallar)}")
-    
     secilen_path = None
     for f in os.listdir(yara_dir):
         if f.startswith('secilen_kurallar'):
@@ -254,6 +423,7 @@ def remove_fp_from_secilen_kurallar(yara_dir):
     yeni_satirlar = []
     atla_modu = False
     parantez_sayaci = 0
+    gercekten_silinenler = set() 
 
     for line in lines:
         if not atla_modu:
@@ -263,6 +433,7 @@ def remove_fp_from_secilen_kurallar(yara_dir):
                 if kural_adi in silinecek_kurallar:
                     atla_modu = True
                     parantez_sayaci = line.count("{") - line.count("}")
+                    gercekten_silinenler.add(kural_adi)
                     continue
             yeni_satirlar.append(line)
         else:
@@ -275,7 +446,13 @@ def remove_fp_from_secilen_kurallar(yara_dir):
     with open(final_yara_path, 'w', encoding='utf-8') as f:
         f.writelines(yeni_satirlar)
         
-    print(f"[+] Hatalı kurallar dosyadan silindi.")
+    bulunamayanlar = silinecek_kurallar - gercekten_silinenler
+    print("\n" + "="*40)
+    print(" TEMİZLİK RAPORU ".center(40, "="))
+    print(f"[+] Başarıyla Silinen Kural Sayısı : {len(gercekten_silinenler)}")
+    if bulunamayanlar:
+        print(f"[-] UYARI: Aşağıdaki kurallar dosyada BULUNAMADI ve atlandı:")
+        for b_kural in bulunamayanlar: print(f"    -> {b_kural}")
     print(f"[+] Temizlenmiş YARA dosyası oluşturuldu: {final_yara_path}")
 
 
@@ -307,8 +484,14 @@ def main():
     
     yedeklenen_log = copy_latest_log(logs_dir, DIR_INCELEME_LOGLARI)
 
+    # Gelişmiş imphash kuralı üretiliyor
     rule2_path = os.path.join(yara_dir, "rule2.yara1") 
-    original_hashes = generate_yara_rule(DIR_KACANLAR_2, rule2_path)
+    print(f"\n[*] Kapsamlı tarama ve Entropy analizi başlatılıyor: {DIR_KACANLAR_2}")
+    analyses = scan_directory(DIR_KACANLAR_2)
+    if not analyses:
+        print("[-] Kacanlar_2 klasöründe geçerli PE dosyası bulunamadı. Kural oluşturulamıyor.")
+    else:
+        create_yara_rules(analyses, "rule2", rule2_path, DEFAULT_FILESIZE_LIMIT)
     
     set_active_yara(yara_dir, "rule2") 
     print(f"\n[BEKLEMEDE] rule2.yara kuralı aktif.")
@@ -316,7 +499,8 @@ def main():
     print("Tarama sonucunu (CSV) '3_Adim_Whitelist_Rule2_CSV' klasörüne kopyalayınız.")
     input("İşlemi tamamladıktan sonra devam etmek için ENTER tuşuna basınız...")
     
-    process_whitelist_rule2(original_hashes)
+    if analyses:
+        process_whitelist_rule2(analyses)
     
     # --- FAZ 2: FORGE KURAL SÜZME VE TEMİZLEME SÜRECİ ---
     if yedeklenen_log:
